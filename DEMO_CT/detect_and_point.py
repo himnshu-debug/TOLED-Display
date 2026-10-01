@@ -24,7 +24,10 @@ SERIAL_PORT = "COM3"     # the Arduino's port
 BAUD = 115200             # matches Serial.begin(115200) in DEV_Config.cpp
 BOTTLE_CLASS_ID = 39      # COCO class id for "bottle"
 CENTER_DEADZONE = 0.12    # fraction of frame width treated as "centered"
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
+MISS_TOLERANCE = 8        # frames allowed to miss detection before declaring "no bottle"
+                          # (YOLO drops a detection here and there even on a steady, well-lit
+                          # bottle - without this the signal flickers between L/R/C and N)
 
 
 def main():
@@ -40,6 +43,8 @@ def main():
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
 
     last_sent = None
+    current_signal = "N"
+    miss_count = 0
     print("Running - show a water bottle to the camera. Press 'q' to quit.")
 
     try:
@@ -61,28 +66,34 @@ def main():
                         best_area = area
                         best_box = (x1, y1, x2, y2)
 
-            signal = "N"
             if best_box:
+                miss_count = 0
                 x1, y1, x2, y2 = best_box
                 cx = (x1 + x2) / 2
                 mid = w / 2
                 deadzone = w * CENTER_DEADZONE
 
                 if cx < mid - deadzone:
-                    signal = "L"
+                    current_signal = "L"
                 elif cx > mid + deadzone:
-                    signal = "R"
+                    current_signal = "R"
                 else:
-                    signal = "C"
+                    current_signal = "C"
 
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                cv2.putText(frame, f"bottle -> {signal}", (int(x1), max(20, int(y1) - 8)),
+                cv2.putText(frame, f"bottle -> {current_signal}", (int(x1), max(20, int(y1) - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                # a missed frame doesn't necessarily mean the bottle is gone - only
+                # declare "no bottle" after several consecutive misses in a row
+                miss_count += 1
+                if miss_count > MISS_TOLERANCE:
+                    current_signal = "N"
 
-            if signal != last_sent:
-                ser.write(signal.encode("ascii"))
-                print(f"signal -> {signal}")
-                last_sent = signal
+            if current_signal != last_sent:
+                ser.write(current_signal.encode("ascii"))
+                print(f"signal -> {current_signal}")
+                last_sent = current_signal
 
             cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 255, 0), 1)
             cv2.imshow("DEMO_CT - water bottle direction", frame)
