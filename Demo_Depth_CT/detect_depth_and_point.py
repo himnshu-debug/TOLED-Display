@@ -7,15 +7,19 @@ it also scales in size with how close the bottle is.
 
 Per frame:
   1. YOLOv8n finds the bottle (COCO class 39) and which side of frame it's on
-  2. Depth Anything V2 Small runs on just the bottle's own crop
-  3. The crop's mean depth-map value becomes a "nearness" score, smoothed
-     over the last few frames, then bucketed into a size tier
+  2. Depth Anything V2 Small runs on just the bottle's own crop, and we read
+     its RAW "predicted_depth" output (higher = nearer) - not the "depth" key,
+     which is a visualization image re-normalized to 0-255 on every single
+     call and therefore nearly constant regardless of true distance
+  3. That raw value is smoothed over a few frames, then classified against a
+     self-calibrating near/far range built from the last ~90 frames (no
+     hardcoded absolute thresholds, since Depth Anything's raw output scale
+     isn't fixed/known in advance)
 
 Sends TWO bytes per update to the Arduino:
     direction: 'L' / 'R' / 'C' / 'N'
     size tier: 'S' (far)  / 'M' (medium) / 'B' (near)
 
-Depth Anything's output convention: higher pixel value = nearer surface.
 This is a RELATIVE depth estimate (not metric distance) - good enough for
 "closer vs farther", not for an actual centimeter reading.
 
@@ -26,7 +30,6 @@ import time
 from collections import deque
 
 import cv2
-import numpy as np
 import serial
 import torch
 from PIL import Image
@@ -41,9 +44,9 @@ CAMERA_INDEX = 1
 MISS_TOLERANCE = 8        # frames allowed to miss detection before declaring "no bottle"
 
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
-DEPTH_HISTORY_LEN = 5     # frames averaged to smooth the nearness score
-NEAR_THRESHOLD = 170      # mean depth value above this -> "B" (big/near)
-FAR_THRESHOLD = 85        # mean depth value below this -> "S" (small/far)
+DEPTH_SMOOTH_LEN = 5      # frames averaged to smooth the nearness score itself
+DEPTH_RANGE_LEN = 90      # frames (~a few seconds) used to self-calibrate near/far
+MIN_OBSERVED_SPREAD = 1e-3  # guard against classifying on near-zero variation
 CROP_PADDING = 0.15       # extra margin around the bbox fed to the depth model
 
 
@@ -67,7 +70,8 @@ def main():
     current_tier = "M"
     miss_count = 0
     last_sent = None
-    depth_history = deque(maxlen=DEPTH_HISTORY_LEN)
+    smooth_history = deque(maxlen=DEPTH_SMOOTH_LEN)   # smooths frame-to-frame noise
+    range_history = deque(maxlen=DEPTH_RANGE_LEN)     # self-calibrates near/far bounds
 
     print("Running - show a water bottle to the camera. Press 'q' to quit.")
 
@@ -116,21 +120,36 @@ def main():
                 if cx2 - cx1 >= 4 and cy2 - cy1 >= 4:
                     crop_bgr = frame[cy1:cy2, cx1:cx2]
                     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-                    depth_img = depth_pipe(Image.fromarray(crop_rgb))["depth"]
-                    nearness = float(np.array(depth_img).mean())
-                    depth_history.append(nearness)
+                    result = depth_pipe(Image.fromarray(crop_rgb))
+                    # "predicted_depth" is the raw model output (higher = nearer).
+                    # "depth" (not used here) is a PIL image re-normalized to 0-255
+                    # PER CALL for visualization, so its mean is nearly constant
+                    # across frames regardless of true distance - not useful for
+                    # comparing "near" vs "far" over time.
+                    predicted = result["predicted_depth"]
+                    nearness = float(predicted.mean())
+                    smooth_history.append(nearness)
+                    range_history.append(nearness)
 
-                if depth_history:
-                    avg_nearness = sum(depth_history) / len(depth_history)
-                    if avg_nearness >= NEAR_THRESHOLD:
-                        current_tier = "B"
-                    elif avg_nearness <= FAR_THRESHOLD:
-                        current_tier = "S"
+                if smooth_history:
+                    avg_nearness = sum(smooth_history) / len(smooth_history)
+                    observed_min = min(range_history)
+                    observed_max = max(range_history)
+                    spread = observed_max - observed_min
+
+                    if spread < MIN_OBSERVED_SPREAD:
+                        current_tier = "M"  # not enough variation seen yet to judge
                     else:
-                        current_tier = "M"
+                        position = (avg_nearness - observed_min) / spread  # 0..1
+                        if position >= 0.66:
+                            current_tier = "B"
+                        elif position <= 0.33:
+                            current_tier = "S"
+                        else:
+                            current_tier = "M"
 
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                depth_label = f"{nearness:.0f}" if nearness is not None else "-"
+                depth_label = f"{nearness:.3f}" if nearness is not None else "-"
                 cv2.putText(frame, f"{current_dir}/{current_tier}  depth~{depth_label}",
                             (int(x1), max(20, int(y1) - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -140,7 +159,10 @@ def main():
                 miss_count += 1
                 if miss_count > MISS_TOLERANCE:
                     current_dir = "N"
-                    depth_history.clear()
+                    smooth_history.clear()
+                    # range_history is left intact - it's long-term self-calibration
+                    # and shouldn't be thrown away just because the bottle briefly
+                    # left the frame
 
             signal = (current_dir, current_tier)
             if signal != last_sent:
