@@ -40,7 +40,7 @@ SERIAL_PORT = "COM3"
 BAUD = 115200
 BOTTLE_CLASS_ID = 39      # COCO class id for "bottle"
 CENTER_DEADZONE = 0.12    # fraction of frame width treated as "centered"
-CAMERA_INDEX = 1
+DEFAULT_CAMERA_INDEX = 1  # used if the user just presses Enter, or picking fails
 MISS_TOLERANCE = 8        # frames allowed to miss detection before declaring "no bottle"
 
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
@@ -48,6 +48,34 @@ DEPTH_SMOOTH_LEN = 5      # frames averaged to smooth the nearness score itself
 DEPTH_RANGE_LEN = 90      # frames (~a few seconds) used to self-calibrate near/far
 MIN_OBSERVED_SPREAD = 1e-3  # guard against classifying on near-zero variation
 CROP_PADDING = 0.15       # extra margin around the bbox fed to the depth model
+
+
+def select_camera(default_index=DEFAULT_CAMERA_INDEX):
+    """List every camera Windows knows about by name and let the user pick one."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        devices = FilterGraph().get_input_devices()
+    except Exception as e:
+        print(f"Could not list cameras by name ({e}); using index {default_index}.")
+        return default_index
+
+    if not devices:
+        print(f"No cameras detected; using index {default_index}.")
+        return default_index
+
+    print("\nAvailable cameras:")
+    for i, name in enumerate(devices):
+        marker = "  <- default" if i == default_index else ""
+        print(f"  [{i}] {name}{marker}")
+
+    choice = input(f"Select a camera by number [default {default_index}]: ").strip()
+    if choice == "":
+        return default_index
+    if choice.isdigit() and int(choice) < len(devices):
+        return int(choice)
+
+    print(f"Didn't recognize '{choice}', using index {default_index}.")
+    return default_index
 
 
 def main():
@@ -58,13 +86,15 @@ def main():
     print(f"Loading {DEPTH_MODEL} (device={'GPU' if device == 0 else 'CPU'})...")
     depth_pipe = pipeline(task="depth-estimation", model=DEPTH_MODEL, device=device)
 
+    camera_index = select_camera()
+
     print(f"Opening {SERIAL_PORT} @ {BAUD} baud...")
     ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
     time.sleep(2)  # let the Uno finish its reset-on-connect before we talk to it
 
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+        raise RuntimeError(f"Could not open camera index {camera_index}")
 
     current_dir = "N"
     current_tier = "M"

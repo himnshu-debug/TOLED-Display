@@ -24,23 +24,53 @@ SERIAL_PORT = "COM3"     # the Arduino's port
 BAUD = 115200             # matches Serial.begin(115200) in DEV_Config.cpp
 BOTTLE_CLASS_ID = 39      # COCO class id for "bottle"
 CENTER_DEADZONE = 0.12    # fraction of frame width treated as "centered"
-CAMERA_INDEX = 1
+DEFAULT_CAMERA_INDEX = 1  # used if the user just presses Enter, or picking fails
 MISS_TOLERANCE = 8        # frames allowed to miss detection before declaring "no bottle"
                           # (YOLO drops a detection here and there even on a steady, well-lit
                           # bottle - without this the signal flickers between L/R/C and N)
+
+
+def select_camera(default_index=DEFAULT_CAMERA_INDEX):
+    """List every camera Windows knows about by name and let the user pick one."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        devices = FilterGraph().get_input_devices()
+    except Exception as e:
+        print(f"Could not list cameras by name ({e}); using index {default_index}.")
+        return default_index
+
+    if not devices:
+        print(f"No cameras detected; using index {default_index}.")
+        return default_index
+
+    print("\nAvailable cameras:")
+    for i, name in enumerate(devices):
+        marker = "  <- default" if i == default_index else ""
+        print(f"  [{i}] {name}{marker}")
+
+    choice = input(f"Select a camera by number [default {default_index}]: ").strip()
+    if choice == "":
+        return default_index
+    if choice.isdigit() and int(choice) < len(devices):
+        return int(choice)
+
+    print(f"Didn't recognize '{choice}', using index {default_index}.")
+    return default_index
 
 
 def main():
     print("Loading YOLOv8n (first run downloads the pretrained weights)...")
     model = YOLO("yolov8n.pt")
 
+    camera_index = select_camera()
+
     print(f"Opening {SERIAL_PORT} @ {BAUD} baud...")
     ser = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
     time.sleep(2)  # let the Uno finish its reset-on-connect before we talk to it
 
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+        raise RuntimeError(f"Could not open camera index {camera_index}")
 
     last_sent = None
     current_signal = "N"
